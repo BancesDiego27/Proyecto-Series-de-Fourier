@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 import base64
 from PIL import Image
-from scipy.fft import fft2, ifft2, fftshift, ifftshift
+import cv2
 
 tab1, tab2 = st.tabs(["Parte I — Fourier Truncada", "Parte II — FFT en Imágenes"])
 with tab1:
@@ -336,58 +336,87 @@ with tab1:
     st.caption("Integrantes: ")
 
 with tab2:
-    st.title("Parte II — Filtros en Imágenes (FFT)")
+    def detectar_blur_fft(img_gray, size=60):
+        f = np.fft.fft2(img_gray)
+        fshift = np.fft.fftshift(f)
+        magnitude_spectrum = np.abs(fshift)
 
-    uploaded_file = st.file_uploader("Sube una imagen (jpg, png, bmp)", type=['jpg','png','bmp'])
-    if uploaded_file is not None:
-        img = Image.open(uploaded_file).convert('L')  # escala de grises
-        img_array = np.array(img, dtype=float)
+        crow, ccol = img_gray.shape[0]//2, img_gray.shape[1]//2
+        magnitude_spectrum[crow-size:crow+size, ccol-size:ccol+size] = 0
+
+        # Energía total vs energía alta frecuencia
+        total_energy = np.sum(np.abs(fshift))
+        high_freq_energy = np.sum(magnitude_spectrum) / total_energy
+
+        return high_freq_energy
 
 
-        # Transformada FFT
-        F = fft2(img_array)
-        F_shifted = fftshift(F)
-        magnitude_spectrum = np.log1p(np.abs(F_shifted))
 
-        st.subheader("Espectro de magnitud (log)")
-        fig_mag, ax_mag = plt.subplots(figsize=(5,5))
-        ax_mag.imshow(magnitude_spectrum, cmap='gray')
-        ax_mag.set_title("FFT (magnitud)")
-        ax_mag.axis('off')
-        st.pyplot(fig_mag)
+    st.title("Parte II – Filtros en Imágenes (FFT)")
 
-        # Selección de filtro
-        st.subheader("Aplicar filtro en frecuencia")
-        filtro_tipo = st.selectbox("Tipo de filtro", ["Pasa bajos", "Pasa altos", "Máscara circular personalizada"])
-        mask = np.ones_like(F_shifted, dtype=float)
-        rows, cols = img_array.shape
-        crow, ccol = rows//2 , cols//2
+    uploaded = st.file_uploader("Sube una imagen", type=["jpg", "png", "jpeg"])
 
-        if filtro_tipo == "Pasa bajos":
-            radio = st.slider("Radio (pixeles)", min_value=5, max_value=min(crow, ccol), value=30)
-            Y, X = np.ogrid[:rows, :cols]
-            mask_area = (X - ccol)**2 + (Y - crow)**2 <= radio**2
-            mask[:] = 0
-            mask[mask_area] = 1
-        elif filtro_tipo == "Pasa altos":
-            radio = st.slider("Radio (pixeles)", min_value=5, max_value=min(crow, ccol), value=30)
-            Y, X = np.ogrid[:rows, :cols]
-            mask_area = (X - ccol)**2 + (Y - crow)**2 <= radio**2
-            mask[:] = 1
-            mask[mask_area] = 0
+    filtro_tipo = st.selectbox("Tipo de filtro", ["Pasa bajas", "Pasa altas"])
+    frecuencia_corte = st.slider("Frecuencia de corte (f_cutoff)", 0.0, 1.0, 0.3, 0.01)
 
-        # Aplicar máscara
-        F_filtered = F_shifted * mask
-        img_filtered = np.abs(ifft2(ifftshift(F_filtered)))
+    if uploaded:
+        # --- Leer imagen y convertir a float
+        img = cv2.imdecode(np.frombuffer(uploaded.read(), np.uint8), cv2.IMREAD_COLOR)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        st.subheader("Imagen filtrada")
-        st.image(img_filtered, use_column_width=True, clamp=True, channels="L")
+        img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        blur_score = detectar_blur_fft(img_gray)
 
-        # Espectro filtrado
-        magnitude_spectrum_filtered = np.log1p(np.abs(F_filtered))
-        st.subheader("Espectro filtrado")
-        fig_filt, ax_filt = plt.subplots(figsize=(5,5))
-        ax_filt.imshow(magnitude_spectrum_filtered, cmap='gray')
-        ax_filt.set_title("FFT filtrada")
-        ax_filt.axis('off')
-        st.pyplot(fig_filt)
+        if blur_score < 0.5:  
+            st.warning(f"La imagen parece borrosa (score={blur_score:.2f})")
+        else:
+            st.success(f"La imagen está nítida (score={blur_score:.2f})")
+
+        # --- FFT por canal (R, G, B)
+        canales_filtrados = []
+        espectro_magnitud = None
+        rows, cols, _ = img_rgb.shape
+        crow, ccol = rows // 2, cols // 2
+        mask = np.zeros((rows, cols, 3), np.float32)
+
+        # --- Crear la máscara (pasa bajas / pasa altas)
+        radius = int(frecuencia_corte * min(crow, ccol))
+        Y, X = np.ogrid[:rows, :cols]
+        dist = np.sqrt((X - ccol)**2 + (Y - crow)**2)
+
+        if filtro_tipo == "Pasa bajas":
+            mask = np.repeat((dist <= radius).astype(np.float32)[:, :, np.newaxis], 3, axis=2) 
+
+        else:
+            mask = np.repeat((dist > radius).astype(np.float32)[:, :, np.newaxis], 3, axis=2)
+
+
+        #  Aplicar FFT a cada canal
+        for i in range(3):
+            F = np.fft.fft2(img_rgb[:, :, i]) #Transformada a dominio frecuencia "2D"
+            F_shift = np.fft.fftshift(F)  #centra la frecuencia cero
+            F_filtered = F_shift * mask[:, :, i] #aplica la máscara de filtro
+            F_ishift = np.fft.ifftshift(F_filtered) #descentra la frecuencia cero
+            img_back = np.abs(np.fft.ifft2(F_ishift)) #Transformada inversa a dominio espacial
+            img_back = np.clip(img_back / np.max(img_back), 0, 1) #normalizado
+            canales_filtrados.append(img_back) #Guarda canal filtrado
+        
+            if i == 0:  # mostrar espectro solo una vez
+                espectro_magnitud = np.log(1 + np.abs(F_shift)) #Espectro de magnitud
+                espectro_magnitud = espectro_magnitud / np.max(espectro_magnitud) #normalizado
+
+        # Combinar canales para imagen final
+        img_filtered = np.dstack(canales_filtrados)
+        img_filtered = np.clip(img_filtered, 0, 1)
+
+        col1, col2, col3 = st.columns(3)
+        col1.image(img_rgb, caption="Original", use_container_width=True)
+        col2.image(espectro_magnitud, caption="Espectro", use_container_width=True, clamp=True)
+        col3.image(img_filtered, caption=f"Filtrada ({filtro_tipo}, f_c={frecuencia_corte})", use_container_width=True, clamp=True)
+
+        
+        st.markdown("### Analisis del filtro aplicado")
+        if filtro_tipo == "Pasa bajas":
+            st.info("El filtro pasa bajas elimina las altas frecuencias → la imagen se suaviza y pierde detalles finos.")
+        else:
+            st.info("El filtro pasa altas elimina las bajas frecuencias → la imagen resalta bordes y detalles, pero pierde regiones suaves.")
