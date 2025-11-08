@@ -1,237 +1,393 @@
+# app.py
+"""
+Serie de Fourier Truncada — v4 (entrada por tramos con a, b numéricos)
+Autor: Diego Bances Mejía (adaptado por asistente)
+Descripción:
+- En lugar de parsear condiciones en texto, el usuario ingresa a y b para cada tramo (numéricos)
+  y la expresión f(t) en ese tramo.
+- Construcción directa de la función por tramos y cálculo de coeficientes con numpy.trapezoid.
+"""
+
 import streamlit as st
 import numpy as np
-import sympy as sp
+import pandas as pd
 import matplotlib.pyplot as plt
+from io import BytesIO
+import base64
 from PIL import Image
-from numpy.fft import fft2, fftshift, ifft2
-from sympy import Piecewise
-from scipy import integrate
-import matplotlib.pyplot as plt
-import cv2
+from scipy.fft import fft2, ifft2, fftshift, ifftshift
 
-st.title("Map Serie de Fourier Truncada y FFT")
+tab1, tab2 = st.tabs(["Parte I — Fourier Truncada", "Parte II — FFT en Imágenes"])
+with tab1:
+    st.set_page_config(page_title="Serie de Fourier Truncada — Parte I (v4)", layout="wide")
 
-section = st.sidebar.radio("Selecciona la sección:", 
-                           ["Parte I - Series de Fourier", 
-                            "Parte II - FFT e Imágenes"])
-
-if section == "Parte I - Series de Fourier":
-    
-    st.set_page_config(page_title="Series de Fourier - Función por tramos ", layout="wide")
-    st.title("Series de Fourier: Funciones por tramos de 2N + 1 términos")
-
-    st.markdown("""
-    **Instrucciones:**
-    1. Ingrese cuántos tramos tiene la función.
-    2. Especifique para cada tramo su expresión y el intervalo donde aplica.
-    3. Ajuste el número de armónicos (N) y presione **Calcular**.
-    """)
-
-    # --- Sidebar Inputs ---
-    st.sidebar.header("Entrada de datos")
-
-    num_tramos = st.sidebar.number_input("Número de tramos", min_value=1, max_value=10, value=3, step=1)
-
-    # Guardamos los tramos en una lista
-    tramos = []
-    for i in range(num_tramos):
-        st.sidebar.markdown(f"**Tramo {i+1}:**")
-        expr_text = st.sidebar.text_input(f"f{i+1}(x) =", i+1 , key=f"expr_{i}")
-        a_i = st.sidebar.text_input(f"Inicio (a{i+1})", "0", key=f"a_{i}")
-        b_i = st.sidebar.text_input(f"Fin (b{i+1})", "0", key=f"b_{i}")
-        tramos.append((expr_text, a_i, b_i))
-
-    N = st.sidebar.slider("N (armónicos)", min_value=0, max_value=50, value=5)
-    resolucion = st.sidebar.slider("Puntos para graficar", 200, 5000, 1000)
-    calcular = st.sidebar.button("Calcular")
-
-    x = sp.symbols('x')
-
-    # --- Funciones auxiliares ---
-    def construir_piecewise(tramos):
+    # ---------------------------
+    # Helpers
+    # ---------------------------
+    SAFE_MATH_NAMES = {
+        'np': np,
+        'sin': np.sin, 'cos': np.cos, 'tan': np.tan,
+        'exp': np.exp, 'sqrt': np.sqrt, 'abs': np.abs,
+        'pi': np.pi, 'e': np.e,
+        'arcsin': np.arcsin, 'arccos': np.arccos, 'arctan': np.arctan,
+        'sinh': np.sinh, 'cosh': np.cosh, 'tanh': np.tanh,
+        'sign': np.sign
+    }
+    def eval_expr(expr: str, t_array: np.ndarray):
         """
-        Construye una expresión SymPy Piecewise a partir de los tramos ingresados.
+        Evalúa la expresión expr en el arreglo t_array y devuelve un array de floats.
+        Permite usar 'np' o nombres como sin, cos (mapeados a numpy).
+        Si el resultado es un escalar, se convierte a un array constante.
         """
-        condiciones = []
-        for expr_text, a_i, b_i in tramos:
-            try:
-                expr = sp.sympify(expr_text)
-                a_val = sp.sympify(a_i)
-                b_val = sp.sympify(b_i)
-                cond = (x >= a_val) & (x < b_val)
-                condiciones.append((expr, cond))
-            except Exception as e:
-                st.error(f"Error al procesar el tramo: {expr_text} en [{a_i}, {b_i}] — {e}")
-                return None
-        return Piecewise(*condiciones)
+        local_env = {**SAFE_MATH_NAMES, 't': t_array}
+        try:
+            result = eval(expr, {"__builtins__": {}}, local_env)
+            if np.isscalar(result):
+                result = np.full_like(t_array, float(result), dtype=float)
+            else:
+                result = np.array(result, dtype=float)
+            return result
+        except Exception as e:
+            st.warning(f"Error evaluando '{expr}': {e}")
+            return np.zeros_like(t_array, dtype=float)
 
-    def integrar(func, a, b):
-        result, _ = integrate.quad(lambda t: float(func(t)), a, b, limit=200)
-        return result
 
-    def calcular_coeficientes(f_np, a, b, N):
+    def build_piecewise_from_numeric(tramos):
+        """
+        tramos: lista de dicts {'a': float, 'b': float, 'expr': str}
+        Retorna:
+        - func(t_array) -> y_array
+        - a_min, b_max (floats)
+        - mensajes de validacion (lista)
+        Reglas:
+        - Para cada tramo se asigna donde (t >= a) & (t < b).
+        - Para el tramo con el máximo b, se hace (t >= a) & (t <= b) para incluir el extremo derecho.
+        """
+        msgs = []
+        # Validar y ordenar tramos por a
+        tramos_sorted = sorted(tramos, key=lambda x: x['a'])
+        # Determinar a_min y b_max
+        a_vals = [tr['a'] for tr in tramos_sorted]
+        b_vals = [tr['b'] for tr in tramos_sorted]
+        a_min = min(a_vals) if a_vals else -np.pi
+        b_max = max(b_vals) if b_vals else np.pi
+        if any(tr['b'] <= tr['a'] for tr in tramos_sorted):
+            msgs.append("Atención: hay tramos con b <= a; revísalos.")
+        # Check for overlaps/gaps (informativo)
+        for i in range(len(tramos_sorted)-1):
+            if tramos_sorted[i]['b'] < tramos_sorted[i+1]['a']:
+                msgs.append(f"Hueco detectado entre tramo {i+1} y {i+2}: [{tramos_sorted[i]['b']}, {tramos_sorted[i+1]['a']}]")
+            if tramos_sorted[i]['b'] > tramos_sorted[i+1]['a']:
+                msgs.append(f"Solapamiento detectado entre tramo {i+1} y {i+2}.")
+
+        def func(t_input):
+            t = np.array(t_input, dtype=float)
+            y = np.zeros_like(t, dtype=float)
+            # last b to include right endpoint
+            b_last = tramos_sorted[-1]['b'] if tramos_sorted else b_max
+            for idx, tr in enumerate(tramos_sorted):
+                a_i = float(tr['a'])
+                b_i = float(tr['b'])
+                expr = tr['expr']
+                if idx == len(tramos_sorted)-1:
+                    mask = (t >= a_i) & (t <= b_i)
+                else:
+                    mask = (t >= a_i) & (t < b_i)
+                if np.any(mask):
+                    try:
+                        vals = eval_expr(expr, t)  # eval full vector
+                        y[mask] = np.array(vals, dtype=float)[mask]
+                    except Exception as e:
+                        # si hay error en la evaluación, marcar y dejar ceros en ese tramo
+                        msgs.append(f"Error evaluando expr en tramo {idx+1} ('{expr}'): {e}")
+                # si no hay puntos en la máscara, no hacemos nada
+            return y
+
+        return func, a_min, b_max, msgs
+
+    def compute_coeffs(func, a, b, N, M=4000):
+        """Calcula a0, an, bn, Ef usando numpy.trapezoid"""
         T = b - a
-        A0 = (1.0 / T) * integrar(f_np, a, b)
-        An, Bn = [], []
-        for n in range(1, N + 1):
-            cos_fun = lambda t, n=n: f_np(t) * np.cos(2 * np.pi * n * (t - a) / T) #Funcion coseno f(t) * cos(...)
-            sin_fun = lambda t, n=n: f_np(t) * np.sin(2 * np.pi * n * (t - a) / T) #Funcion seno   f(t) * sin(...)
-            an = (2.0 / T) * integrate.quad(lambda t: float(cos_fun(t)), a, b, limit=200)[0] 
-            bn = (2.0 / T) * integrate.quad(lambda t: float(sin_fun(t)), a, b, limit=200)[0]
-            An.append(an)
-            Bn.append(bn)
-        return A0, np.array(An), np.array(Bn)
+        omega = 2*np.pi / T
+        t = np.linspace(a, b, M, endpoint=False)
+        y = func(t)
+        Ef = np.trapezoid(y**2, t)
+        a0 = (1.0/T) * np.trapezoid(y, t)
+        an = np.zeros(N)
+        bn = np.zeros(N)
+        for n in range(1, N+1):
+            an[n-1] = (2.0/T) * np.trapezoid(y * np.cos(n*omega*t), t)
+            bn[n-1] = (2.0/T) * np.trapezoid(y * np.sin(n*omega*t), t)
+        return a0, an, bn, Ef, t, y
 
-    def evaluar_serie_truncada(A0, An, Bn, a, b, xs): #Evalua la serie truncada en los puntos x
-        T = b - a
-        y = np.full_like(xs, A0, dtype=float)
-        for idx, n in enumerate(range(1, len(An) + 1)):
-            y += An[idx] * np.cos(2 * np.pi * n * (xs - a) / T) + Bn[idx] * np.sin(2 * np.pi * n * (xs - a) / T)
+    def fourier_eval(a0, an, bn, T, t_eval):
+        omega = 2*np.pi / T
+        y = np.full_like(t_eval, a0, dtype=float)
+        for n, (a_n, b_n) in enumerate(zip(an, bn), start=1):
+            y += a_n * np.cos(n*omega*t_eval) + b_n * np.sin(n*omega*t_eval)
         return y
 
-    # --- Main computation ---
-    if calcular:
-        expr_partes = construir_piecewise(tramos)
-        if expr_partes is None:
+    def coeffs_df(a0, an, bn):
+        df = pd.DataFrame({
+            'n': [0] + list(range(1, len(an)+1)),
+            'a_n': [a0] + list(an),
+            'b_n': [0.0] + list(bn)
+        })
+        return df
+
+    def csv_link(df, filename="coeficientes_fourier.csv"):
+        buf = BytesIO()
+        df.to_csv(buf, index=False)
+        buf.seek(0)
+        b64 = base64.b64encode(buf.read()).decode()
+        return f"data:file/csv;base64,{b64}"
+
+    # ---------------------------
+    # UI (única vista)
+    # ---------------------------
+    st.title("Serie de Fourier Truncada — Parte I (v4)")
+    st.markdown("Define la función por tramos usando valores numéricos para cada tramo: inicio `a`, fin `b` y la expresión en `t` (ej: `0`, `t+2`, `np.sin(t)`, `sin(t)`). Se detecta automáticamente el intervalo total y el período.")
+
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        st.header("Definir función por tramos")
+        modo = st.selectbox("Modo", ["f1 predefinida (rectangular)", "f2 predefinida (rampa)", "Personalizada (numérica)"])
+        tramos = []
+        if modo.startswith("f1"):
+            st.latex(r"f_1(t)=\begin{cases}0 & -2<t<-1 \\ 1 & -1<t<1 \\ 0 & 1<t<2\end{cases}")
+            tramos = [
+                {'a': -2.0, 'b': -1.0, 'expr': '0'},
+                {'a': -1.0, 'b':  1.0, 'expr': '1'},
+                {'a':  1.0, 'b':  2.0, 'expr': '0'}
+            ]
+        elif modo.startswith("f2"):
+            st.latex(r"f_2(t)=\begin{cases}0 & -2<t<-1 \\ t+2 & -1<t<1 \\ 0 & 1<t<2\end{cases}")
+            tramos = [
+                {'a': -2.0, 'b': -1.0, 'expr': '0'},
+                {'a': -1.0, 'b':  1.0, 'expr': 't + 2'},
+                {'a':  1.0, 'b':  2.0, 'expr': '0'}
+            ]
+        else:
+            st.markdown("Ingresa el número de tramos y luego completa `a`, `b` y la expresión en t para cada tramo.")
+            n_tramos = st.number_input("Número de tramos:", min_value=1, max_value=12, value=3, step=1)
+            for i in range(int(n_tramos)):
+                st.markdown(f"**Tramo {i+1}**")
+                a_i = st.number_input(f"a_{i+1} (inicio):", value=-2.0 + i*1.0, key=f"a_{i}")
+                b_i = st.number_input(f"b_{i+1} (fin):", value=-1.0 + i*1.0, key=f"b_{i}")
+                expr_i = st.text_input(f"Expr tramo {i+1} (ej: 0, t+2, np.sin(t)):", value=("0" if i!=1 else "t + 2"), key=f"expr_{i}")
+                tramos.append({'a': a_i, 'b': b_i, 'expr': expr_i})
+
+        st.markdown("---")
+        st.header("Parámetros de cálculo")
+        N = st.slider("Número de armónicos N:", min_value=1, max_value=120, value=10)
+        M = st.number_input("Puntos para integración (M):", min_value=200, max_value=200000, value=4000, step=200)
+        st.markdown("Botones rápidos:")
+        c1, c2, c3 = st.columns(3)
+        if c1.button("N = 3"):
+            N = 3
+        if c2.button("N = 5"):
+            N = 5
+        if c3.button("N = 10"):
+            N = 10
+
+        st.markdown("---")
+        st.markdown("**Información y ayuda**")
+        st.markdown(r"""
+        - Los coeficientes se calculan numéricamente usando la regla del trapecio sobre una malla densa.  
+        - Fórmulas usadas:  
+        - $a_0 = \dfrac{1}{T}\int_a^{a+T} f(t)\,dt$  
+        - $a_n = \dfrac{2}{T}\int_a^{a+T} f(t)\cos(n\omega t)\,dt$  
+        - $b_n = \dfrac{2}{T}\int_a^{a+T} f(t)\sin(n\omega t)\,dt$ con $\omega=\dfrac{2\pi}{T}$  
+        - ICE(N) según el enunciado:  
+        
+        $$\text{ICE}(N) = E_f - \left( a_0^2 T + \frac{T}{2} \sum_{n=1}^{N} (a_n^2 + b_n^2) \right)$$
+        """)
+        st.markdown("Se usa `numpy.trapezoid` para las integrales (eficiente para mallas densas).")
+
+    with col2:
+        st.header("Resultados y visualización")
+
+        # Construir función por tramos (numéricos)
+        func, a_tot, b_tot, messages = build_piecewise_from_numeric(tramos)
+
+        # Previsualización de la función definida (un periodo)
+        st.subheader("Previsualización de la función (un periodo)")
+        t_preview = np.linspace(a_tot, b_tot, 2000, endpoint=False)
+        y_preview = func(t_preview)
+
+        fig_p, ax_p = plt.subplots(figsize=(9,3))
+        ax_p.plot(t_preview, y_preview, linewidth=1.5)
+        ax_p.set_xlabel("t")
+        ax_p.grid(True)
+        ax_p.set_title("Función definida por tramos")
+        st.pyplot(fig_p)
+
+
+        T = b_tot - a_tot
+        if T <= 0:
+            st.error("El intervalo total detectado no es válido (T <= 0). Revisa los valores a/b de los tramos.")
             st.stop()
-        
-        st.write("**Función por partes:**")
-        st.latex(sp.latex(expr_partes))
 
-        a = float(sp.N(sp.sympify(tramos[0][1]))) #Primer límite
-        b = float(sp.N(sp.sympify(tramos[-1][2]))) #Último límite
-        T = b - a #Período
-        f_np = sp.lambdify(x, expr_partes, "numpy") 
-
-        st.subheader("Resultados")
-        st.write(f"Período: **T = {T:.6g}**")
-
-        def f_wrapped(t): #Estandariza la entrada para que siempre sea un array numpy 
-            arr = np.array(t)
-            return f_np(arr)
+        # Mostrar mensajes de validación si existen
+        if messages:
+            st.subheader("Advertencias / mensajes")
+            for m in messages:
+                st.warning(m)
 
 
-        with st.spinner("Calculando coeficientes..."):
-            A0, An, Bn = calcular_coeficientes(f_wrapped, a, b, N)
 
-        st.write("### Coeficientes (numéricos)")
-        st.write(f"a₀ = {A0:.6g}")
-        for i in range(len(An)):
-            st.write(f"a{i+1} = {An[i]:.6g},   b{i+1} = {Bn[i]:.6g}")
+        # Cálculo de coeficientes
+        st.subheader("Cálculo de coeficientes")
+        with st.spinner("Calculando..."):
+            try:
+                a0, an, bn, Ef, t_malla, y_true = compute_coeffs(func, a_tot, b_tot, N, M=M)
+            except Exception as e:
+                st.error(f"Error en el cálculo numérico: {e}")
+                st.stop()
 
-        # Energía
-        energia = integrate.quad(lambda t: float(f_wrapped(t)**2), a, b, limit=200)[0]
-        ice_parentesis = (T * (A0**2 + 0.5 * np.sum(An**2 + Bn**2)))
-        ice= energia - ice_parentesis
+        series_energy = a0**2 * T + (T/2.0) * np.sum(an**2 + bn**2)
+        ICE = Ef - series_energy
+        ICE_ratio = ICE / Ef if Ef != 0 else np.nan
+        omega = 2*np.pi / T
+        colA, colB = st.columns(2)
+        with colA:
+            st.write(f"Intervalo detectado: [{a_tot}, {b_tot}]")
+            st.write(f"Período T = {T:.6g}")
+            st.write(f"Omega ω = 2π/T = {omega:.6g}")
+            st.write(f"Energía Ef ≈ {Ef:.6e}")
+            st.write(f"a₀ ≈ {a0:.6e}")
+        with colB:
+            st.write(f"Energía por la serie (hasta N): {series_energy:.6e}")
+            st.write(f"ICE(N) = Ef - [...] ≈ {ICE:.6e}")
+            st.write(f"ICE / Ef = {ICE_ratio:.2%}")
+            if ICE <= 0.02 * Ef:
+                st.success("ICE ≤ 0.02 Ef (condición satisfecha)")
+            else:
+                st.warning("ICE > 0.02 Ef")
 
-        st.write("### Energía")
-        st.write(f"Energia de la señal = {energia:.6g}")
-        st.write(f"Energia según coeficientes (ICE) = {ice_parentesis:.6g}  ")
-        st.write(f"Integral cuadrada del Error (ICE) = {ice:.6g}  ")
+        st.markdown("---")
+        st.subheader("Ecuación truncada (con ω y primeros términos)")
+        st.latex(r"f_N(t) = a_0 + \sum_{n=1}^{N} \left[ a_n \cos(n\omega t) + b_n \sin(n\omega t)\right], \quad \omega = \frac{2\pi}{T}")
+        # Mostrar un ejemplo con valores numéricos para los primeros términos
+        def build_latex_values(a0, an, bn, show=6):
+            s = f"{a0:.4e} "
+            upto = min(len(an), show)
+            for n in range(1, upto+1):
+                s += f"+ ({an[n-1]:.4e})\\cos({n}\\omega t) + ({bn[n-1]:.4e})\\sin({n}\\omega t) "
+            if len(an) > show:
+                s += "+ \\dots"
+            return s
+        st.latex(build_latex_values(a0, an, bn, show=10))
 
-        if ice <= 0.02 * energia:
-            st.success("Cumple la condición de energía (ICE ≤ 0.02Ef)")
-        else:
-            st.error("No cumple la condición de energía (ICE ≤ 0.02Ef)")
-        
-        # Gráfica
-        xs = np.linspace(a, b, resolucion)
-        ys = f_wrapped(xs)
+        # Gráfica: original extendida y serie truncada (varios periodos)
+        st.subheader("Original (extendida) vs Serie truncada")
+        t_plot = np.linspace(a_tot - 0.5*T, b_tot + 0.5*T, 3000)
+        # repetir la señal original periódicamente usando modulo
+        t_mapped = ((t_plot - a_tot) % T) + a_tot
+        y_periodic = func(t_mapped)
+        y_series = fourier_eval(a0, an, bn, T, t_plot)
 
-        y_trunc = evaluar_serie_truncada(A0, An, Bn, a, b, xs)
+        fig_s, ax_s = plt.subplots(figsize=(10,3.5))
+        ax_s.plot(t_plot, y_periodic, label="Original (período repetido)", linewidth=1.5)
+        ax_s.plot(t_plot, y_series, linestyle='--', label=f"Serie truncada (N={N})", linewidth=1.2)
+        ax_s.set_xlabel("t")
+        ax_s.legend()
+        ax_s.grid(True)
+        st.pyplot(fig_s)
 
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.set_title(f"Comparación: f(x) original vs Serie truncada (N={N})")
-        ax.plot(xs, ys, label="f(x) original")
-        ax.plot(xs, y_trunc, "--", label=f"Serie truncada (N={N})")
-        ax.legend()
-        ax.grid(True)
-        ax.set_xlabel("x")
-        ax.set_ylabel("f(x)")
-        st.pyplot(fig)
-        
-        #Ecuación de la serie truncada
-        st.subheader("Ecuación de la serie de Fourier truncada")
-        omega0 = 2 * sp.pi / T
-        ecuacion = A0
+        # Residuo en un periodo
+        st.subheader("Residuo en un período (f - f_N)")
+        t_res = np.linspace(a_tot, b_tot, 2000, endpoint=False)
+        resid = func(t_res) - fourier_eval(a0, an, bn, T, t_res)
+        fig_r, ax_r = plt.subplots(figsize=(9,2.5))
+        ax_r.plot(t_res, resid)
+        ax_r.grid(True)
+        ax_r.set_title("Residuo f(t) - f_N(t)")
+        st.pyplot(fig_r)
 
-        for n in range(1, N+1):
-            ecuacion += An[n-1]*sp.cos(n*omega0*x) + Bn[n-1]*sp.sin(n*omega0*x)
+        # Tabla de coeficientes y descarga CSV
+        st.subheader("Coeficientes numéricos")
+        df_coef = coeffs_df(a0, an, bn)
+        st.dataframe(df_coef, use_container_width=True)
+        href = csv_link(df_coef)
+        st.markdown(f"[Descargar coeficientes (CSV)]({href})")
 
-        st.latex(ecuacion)
-        
+        # Evolución ICE con N de ejemplo
+        st.subheader("Evolución de ICE(N) — muestras")
+        Ns_test = [1,2,3,5,10,20,40,80]
+        Ns_test = [n for n in Ns_test if n <= 200]
+        ICE_vals = []
+        for ntest in Ns_test:
+            a0t, ant, bnt, Eft, _, _ = compute_coeffs(func, a_tot, b_tot, ntest, M=M)
+            series_energy_t = a0t**2 * T + (T/2.0) * np.sum(ant**2 + bnt**2)
+            ICE_vals.append(Eft - series_energy_t)
 
-    else:
-        st.info("Complete los tramos y presione **Calcular** para obtener la serie de Fourier.")
+        fig_ice, ax_ice = plt.subplots(figsize=(8,3))
+        ax_ice.plot(Ns_test, ICE_vals, marker='o')
+        ax_ice.axhline(0.02 * Ef, color='red', linestyle='--', label='0.02 * Ef')
+        ax_ice.set_xlabel("N")
+        ax_ice.set_ylabel("ICE(N)")
+        ax_ice.grid(True)
+        ax_ice.legend()
+        st.pyplot(fig_ice)
 
-    
-elif section == "Parte II - FFT e Imágenes":
-    st.title("Parte II – Filtros en Imágenes (FFT)")
+    st.markdown("---")
+    st.caption("Integrantes: ")
 
-    uploaded = st.file_uploader("Sube una imagen", type=["jpg", "png", "jpeg"])
+with tab2:
+    st.title("Parte II — Filtros en Imágenes (FFT)")
 
-    filtro_tipo = st.selectbox("Tipo de filtro", ["Pasa bajas", "Pasa altas"])
-    frecuencia_corte = st.slider("Frecuencia de corte (f_cutoff)", 0.0, 1.0, 0.3, 0.01)
-
-    if uploaded:
-        # --- Leer imagen y convertir a float
-        img = cv2.imdecode(np.frombuffer(uploaded.read(), np.uint8), cv2.IMREAD_COLOR)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-
-        # --- FFT por canal (R, G, B)
-        canales_filtrados = []
-        espectro_magnitud = None
-        rows, cols, _ = img_rgb.shape
-        crow, ccol = rows // 2, cols // 2
-        mask = np.zeros((rows, cols, 3), np.float32)
-
-        # --- Crear la máscara (pasa bajas / pasa altas)
-        radius = int(frecuencia_corte * min(crow, ccol))
-        Y, X = np.ogrid[:rows, :cols]
-        dist = np.sqrt((X - ccol)**2 + (Y - crow)**2)
-
-        if filtro_tipo == "Pasa bajas":
-            mask = np.repeat((dist <= radius).astype(np.float32)[:, :, np.newaxis], 3, axis=2) 
-
-        else:
-            mask = np.repeat((dist > radius).astype(np.float32)[:, :, np.newaxis], 3, axis=2)
+    uploaded_file = st.file_uploader("Sube una imagen (jpg, png, bmp)", type=['jpg','png','bmp'])
+    if uploaded_file is not None:
+        img = Image.open(uploaded_file).convert('L')  # escala de grises
+        img_array = np.array(img, dtype=float)
 
 
-        #  Aplicar FFT a cada canal
-        for i in range(3):
-            F = np.fft.fft2(img_rgb[:, :, i]) #Transformada a dominio frecuencia "2D"
-            F_shift = np.fft.fftshift(F)  #centra la frecuencia cero
-            F_filtered = F_shift * mask[:, :, i] #aplica la máscara de filtro
-            F_ishift = np.fft.ifftshift(F_filtered) #descentra la frecuencia cero
-            img_back = np.abs(np.fft.ifft2(F_ishift)) #Transformada inversa a dominio espacial
-            img_back = np.clip(img_back / np.max(img_back), 0, 1) #normalizado
-            canales_filtrados.append(img_back) #Guarda canal filtrado
+        # Transformada FFT
+        F = fft2(img_array)
+        F_shifted = fftshift(F)
+        magnitude_spectrum = np.log1p(np.abs(F_shifted))
 
-            if i == 0:  # mostrar espectro solo una vez
-                espectro_magnitud = np.log(1 + np.abs(F_shift)) #Espectro de magnitud
-                espectro_magnitud = espectro_magnitud / np.max(espectro_magnitud) #normalizado
+        st.subheader("Espectro de magnitud (log)")
+        fig_mag, ax_mag = plt.subplots(figsize=(5,5))
+        ax_mag.imshow(magnitude_spectrum, cmap='gray')
+        ax_mag.set_title("FFT (magnitud)")
+        ax_mag.axis('off')
+        st.pyplot(fig_mag)
 
-        # Combinar canales para imagen final
-        img_filtered = np.dstack(canales_filtrados)
-        img_filtered = np.clip(img_filtered, 0, 1)
+        # Selección de filtro
+        st.subheader("Aplicar filtro en frecuencia")
+        filtro_tipo = st.selectbox("Tipo de filtro", ["Pasa bajos", "Pasa altos", "Máscara circular personalizada"])
+        mask = np.ones_like(F_shifted, dtype=float)
+        rows, cols = img_array.shape
+        crow, ccol = rows//2 , cols//2
 
-        col1, col2, col3 = st.columns(3)
-        col1.image(img_rgb, caption="Original", use_container_width=True)
-        col2.image(espectro_magnitud, caption="Espectro", use_container_width=True, clamp=True)
-        col3.image(img_filtered, caption=f"Filtrada ({filtro_tipo}, f_c={frecuencia_corte})", use_container_width=True, clamp=True)
+        if filtro_tipo == "Pasa bajos":
+            radio = st.slider("Radio (pixeles)", min_value=5, max_value=min(crow, ccol), value=30)
+            Y, X = np.ogrid[:rows, :cols]
+            mask_area = (X - ccol)**2 + (Y - crow)**2 <= radio**2
+            mask[:] = 0
+            mask[mask_area] = 1
+        elif filtro_tipo == "Pasa altos":
+            radio = st.slider("Radio (pixeles)", min_value=5, max_value=min(crow, ccol), value=30)
+            Y, X = np.ogrid[:rows, :cols]
+            mask_area = (X - ccol)**2 + (Y - crow)**2 <= radio**2
+            mask[:] = 1
+            mask[mask_area] = 0
 
-        
-        st.markdown("### Analisis del filtro aplicado")
-        if filtro_tipo == "Pasa bajas":
-            st.info("El filtro pasa bajas elimina las altas frecuencias → la imagen se suaviza y pierde detalles finos.")
-        else:
-            st.info("El filtro pasa altas elimina las bajas frecuencias → la imagen resalta bordes y detalles, pero pierde regiones suaves.")
-st.markdown("""
-<div style='text-align:center; margin-top:50px; color:grey;'>
-    <hr>
-    <b>Integrantes</b>
-    <p>
-  Diego Alberto Bances Mejía 20001745 | Federico Randall Guoz Baran 23000298 | Cristian Omar Alfaro Tzun 22010745</p>
-</div>
-""", unsafe_allow_html=True)
+        # Aplicar máscara
+        F_filtered = F_shifted * mask
+        img_filtered = np.abs(ifft2(ifftshift(F_filtered)))
+
+        st.subheader("Imagen filtrada")
+        st.image(img_filtered, use_column_width=True, clamp=True, channels="L")
+
+        # Espectro filtrado
+        magnitude_spectrum_filtered = np.log1p(np.abs(F_filtered))
+        st.subheader("Espectro filtrado")
+        fig_filt, ax_filt = plt.subplots(figsize=(5,5))
+        ax_filt.imshow(magnitude_spectrum_filtered, cmap='gray')
+        ax_filt.set_title("FFT filtrada")
+        ax_filt.axis('off')
+        st.pyplot(fig_filt)
