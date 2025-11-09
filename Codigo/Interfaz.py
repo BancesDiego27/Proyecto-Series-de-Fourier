@@ -334,9 +334,6 @@ with tab1:
         ax_ice.legend()
         st.pyplot(fig_ice)
 
-    st.markdown("---")
-    st.caption("Integrantes: ")
-
 with tab2:
     def detectar_blur_fft(img_gray, size=60):
         f = np.fft.fft2(img_gray)
@@ -466,3 +463,11 @@ with tab2:
             st.info("El filtro pasa bajas elimina las altas frecuencias → la imagen se suaviza y pierde detalles finos.")
         else:
             st.info("El filtro pasa altas elimina las bajas frecuencias → la imagen resalta bordes y detalles, pero pierde regiones suaves.")
+st.markdown("""
+<div style='text-align:center; margin-top:50px; color:grey;'>
+    <hr>
+    <b>Integrantes</b>
+    <p>
+  Diego Alberto Bances Mejía 20001745 | Federico Randall Guoz Baran 23000298 | Cristian Omar Alfaro Tzun 22010745</p>
+</div>
+""", unsafe_allow_html=True)
