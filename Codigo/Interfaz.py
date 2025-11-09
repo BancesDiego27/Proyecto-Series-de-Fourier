@@ -450,7 +450,7 @@ with tab2:
             st.write(MODEL_PATH)
 
             sr = cv2.dnn_superres.DnnSuperResImpl.create()
-            sr.readModel("ESPCN_x3.pb")  # modelo debe estar en el mismo directorio
+            sr.readModel(MODEL_PATH)  # modelo debe estar en el mismo directorio
             sr.setModel("espcn", 3)
             img_superres = sr.upsample(img_denoised)
             col1, col2,col3,col4= st.columns(4)
