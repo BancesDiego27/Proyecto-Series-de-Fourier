@@ -445,6 +445,10 @@ with tab2:
 
         # 2️⃣ Super Resolution con modelo preentrenado
         try:
+            import os
+            MODEL_PATH = os.path.join(os.path.dirname(__file__), "ESPCN_x3.pb")
+            st.write(MODEL_PATH)
+
             sr = cv2.dnn_superres.DnnSuperResImpl.create()
             sr.readModel("ESPCN_x3.pb")  # modelo debe estar en el mismo directorio
             sr.setModel("espcn", 3)
