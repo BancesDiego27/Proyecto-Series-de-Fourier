@@ -16,8 +16,6 @@ from io import BytesIO
 import base64
 from PIL import Image
 import cv2
-from cv2 import dnn_superres
-
 
 tab1, tab2 = st.tabs(["Parte I — Fourier Truncada", "Parte II — FFT en Imágenes"])
 with tab1:
@@ -411,55 +409,11 @@ with tab2:
         img_filtered = np.dstack(canales_filtrados)
         img_filtered = np.clip(img_filtered, 0, 1)
 
-        img_filtered = np.dstack(canales_filtrados)
-        img_filtered = np.clip(img_filtered, 0, 1)
-
         col1, col2, col3 = st.columns(3)
         col1.image(img_rgb, caption="Original", use_container_width=True)
         col2.image(espectro_magnitud, caption="Espectro", use_container_width=True, clamp=True)
         col3.image(img_filtered, caption=f"Filtrada ({filtro_tipo}, f_c={frecuencia_corte})", use_container_width=True, clamp=True)
 
-           # --- 𝐀. Agregar ruido artificial ---
-        st.markdown("## Agregar ruido y aplicar filtros IA")
-        ruido_sigma = st.slider("Intensidad del ruido (σ)", 0, 50, 20)
-        noise = np.random.normal(0, ruido_sigma, img_rgb.shape).astype(np.float32)
-        img_noisy = np.clip(img_rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-        #st.image(img_noisy, caption=f"Imagen con ruido (σ={ruido_sigma})", use_container_width=True)
-
-        # --- 𝐁. Filtro FFT sobre imagen con ruido ---
-        canales_ruido_filtrados = []
-        for i in range(3):
-            F = np.fft.fft2(img_noisy[:, :, i])
-            F_shift = np.fft.fftshift(F)
-            F_filtered = F_shift * mask[:, :, i]
-            F_ishift = np.fft.ifftshift(F_filtered)
-            img_back = np.abs(np.fft.ifft2(F_ishift))
-            img_back = np.clip(img_back / np.max(img_back), 0, 1)
-            canales_ruido_filtrados.append(img_back)
-        img_fft_denoised = np.dstack(canales_ruido_filtrados)
-       
-        # --- 𝐂. Filtro IA (Denoising + Super Resolution) ---
-        st.markdown("### Filtro basado en IA")
-
-        # 1️⃣ Denoising IA con OpenCV
-        img_denoised = cv2.fastNlMeansDenoisingColored(img_noisy, None, 10, 10, 7, 21)
-        #st.image(img_denoised, caption="IA Denoising (fastNlMeansDenoisingColored)", use_container_width=True)
-        
-
-        # 2️⃣ Super Resolution con modelo preentrenado
-        try:
-            sr = cv2.dnn_superres.DnnSuperResImpl.create()
-            sr.readModel("ESPCN_x3.pb")  # modelo debe estar en el mismo directorio
-            sr.setModel("espcn", 3)
-            img_superres = sr.upsample(img_denoised)
-            col1, col2,col3,col4= st.columns(4)
-            col1.image(img_noisy, caption=f"Imagen con ruido (σ={ruido_sigma})", use_container_width=True)
-            col2.image(img_fft_denoised, caption="Filtrada con FFT (ruido reducido)", use_container_width=True, clamp=True)
-            col3.image(img_denoised, caption="Denoising IA", use_container_width=True)
-            col4.image(img_superres, caption="IA Super Resolution (ESPCN ×3)", use_container_width=True)
-        except Exception as e:
-            st.error(f"Error aplicando Super Resolution: {e}")
-            st.warning("No se encontró el modelo 'ESPCN_x3.pb'. Descárgalo desde: https://github.com/opencv/opencv_contrib/tree/master/modules/dnn_superres/samples")
         
         st.markdown("### Analisis del filtro aplicado")
         if filtro_tipo == "Pasa bajas":
