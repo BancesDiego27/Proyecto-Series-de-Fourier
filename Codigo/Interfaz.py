@@ -447,7 +447,6 @@ with tab2:
         try:
             import os
             MODEL_PATH = os.path.join(os.path.dirname(__file__), "ESPCN_x3.pb")
-            st.write(MODEL_PATH)
 
             sr = cv2.dnn_superres.DnnSuperResImpl.create()
             sr.readModel(MODEL_PATH)  # modelo debe estar en el mismo directorio
